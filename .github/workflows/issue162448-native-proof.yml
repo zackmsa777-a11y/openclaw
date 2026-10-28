@@ -1,0 +1,210 @@
+# Fork-only native proof harness. Do not include this file in the upstream PR.
+name: Linux native assistant caption clearance proof
+
+on:
+  push:
+    branches: [test/linux-assistant-native-proof-162448]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue162448-native-proof-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-proof:
+    if: github.repository == 'zackmsa777-a11y/openclaw'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      PRODUCT_SHA: 069ed9816926586fd203f8be9ff4b459818217e8
+      BASE_SHA: 8889b596023c846cc9076078a000c25715f0ecf0
+      CSS_PATH: ui/src/styles/assistant-panel.css
+      PROOF_ROOT: .artifacts/issue162448-native
+      WORK_ROOT: ${{ runner.temp }}/issue162448-native
+      CARGO_BUILD_JOBS: "2"
+      # Keep the ordinary debug build; omit symbols to bound cold build cost.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Check out exact proof candidate without retained credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          submodules: false
+
+      - name: Create evidence directories and bind source identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROOF_ROOT/before" "$PROOF_ROOT/after" "$WORK_ROOT/assets"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 https://github.com/openclaw/openclaw.git "$BASE_SHA"
+          git fetch --no-tags --depth=1 https://github.com/zackmsa777-a11y/openclaw.git "$PRODUCT_SHA"
+          git cat-file -e "$BASE_SHA:$CSS_PATH"
+          git diff --exit-code "$PRODUCT_SHA" -- ui apps/linux/src-tauri apps/linux/ui apps/linux/scripts crates
+          {
+            printf 'proof_head=%s\nproduct=%s\nbaseline_css=%s\n' "$GITHUB_SHA" "$PRODUCT_SHA" "$BASE_SHA"
+            sha256sum "$CSS_PATH" apps/linux/src-tauri/Cargo.lock
+            printf '\nbaseline_css_sha256='
+            git show "$BASE_SHA:$CSS_PATH" | sha256sum
+          } > "$PROOF_ROOT/identity.txt"
+
+      - name: Install native X11 and WebKitGTK dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            at-spi2-core build-essential curl dbus-x11 file fonts-dejavu-core \
+            gir1.2-atspi-2.0 gnome-keyring imagemagick libatk-adaptor \
+            libayatana-appindicator3-dev libegl1 libgles2 librsvg2-dev \
+            libssl-dev libwebkit2gtk-4.1-dev libxdo-dev openbox patchelf \
+            procps psmisc python3-gi unzip wget wmctrl x11-utils xauth \
+            xdg-utils xdotool xvfb
+          dpkg-query -W libwebkit2gtk-4.1-0 libgtk-3-0 openbox xvfb \
+            > "$PROOF_ROOT/native-versions.txt"
+
+      - name: Set up the supported Node runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.1
+
+      - name: Install pinned JavaScript dependencies and stable Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          test "$(corepack pnpm --version)" = "12.15.0"
+          corepack pnpm install --frozen-lockfile
+          rustup toolchain install stable --profile minimal
+          {
+            node --version
+            corepack pnpm --version
+            rustc +stable --version --verbose
+            cargo +stable --version
+          } >> "$PROOF_ROOT/identity.txt"
+
+      - name: Build one native candidate with the upstream synthetic runtime
+        working-directory: apps/linux/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          node ../scripts/stage-runtime.mjs --runtime-only
+          python3 ../tests/stage_onboarding_runtime.py target/desktop-runtime
+          /usr/bin/time -p -o "$GITHUB_WORKSPACE/$PROOF_ROOT/native-build-time.txt" \
+            cargo +stable build --locked \
+            2>&1 | tee "$GITHUB_WORKSPACE/$PROOF_ROOT/native-build.log"
+          sha256sum target/debug/openclaw-desktop \
+            >> "$GITHUB_WORKSPACE/$PROOF_ROOT/identity.txt"
+
+      - name: Build original and repaired full Control UI assets
+        shell: bash
+        env:
+          NODE_ENV: production
+        run: |
+          set -euo pipefail
+          trap 'git show "$GITHUB_SHA:$CSS_PATH" > "$CSS_PATH"' EXIT
+          git show "$BASE_SHA:$CSS_PATH" > "$CSS_PATH"
+          /usr/bin/time -p -o "$PROOF_ROOT/before-build-time.txt" \
+            node --import ./scripts/tsx.mjs ui/src/test-helpers/control-ui-e2e.ts \
+            --production-build "$WORK_ROOT/assets/before" \
+            2>&1 | tee "$PROOF_ROOT/before-build.log"
+          git show "$GITHUB_SHA:$CSS_PATH" > "$CSS_PATH"
+          git diff --exit-code -- "$CSS_PATH"
+          /usr/bin/time -p -o "$PROOF_ROOT/after-build-time.txt" \
+            node --import ./scripts/tsx.mjs ui/src/test-helpers/control-ui-e2e.ts \
+            --production-build "$WORK_ROOT/assets/after" \
+            2>&1 | tee "$PROOF_ROOT/after-build.log"
+          sha256sum "$WORK_ROOT/assets/before/index.html" \
+            "$WORK_ROOT/assets/after/index.html" >> "$PROOF_ROOT/identity.txt"
+          for phase in before after; do
+            (
+              cd "$WORK_ROOT/assets/$phase"
+              find . -type f -print0 | sort -z | xargs -0 sha256sum
+            ) > "$GITHUB_WORKSPACE/$PROOF_ROOT/$phase/assets.sha256"
+          done
+
+      - name: Prepare synthetic Gateway data without replacing native chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          for phase in before after; do
+            node --import ./scripts/tsx.mjs apps/linux/tests/issue162448_fixture.mts \
+              "$WORK_ROOT/fixture/$phase" "$WORK_ROOT/assets/$phase"
+          done
+          sha256sum apps/linux/tests/issue162448_fixture.mts \
+            apps/linux/tests/issue162448_native.py >> "$PROOF_ROOT/identity.txt"
+          test "$(id -u)" -ne 0
+          test -z "${WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS:-}"
+
+      - name: Prove native overlap on the original stylesheet
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          /usr/bin/time -p -o "$PROOF_ROOT/before-time.txt" \
+            xvfb-run -a -s '-screen 0 1440x1000x24' dbus-run-session -- \
+            /usr/bin/python3 apps/linux/tests/issue162448_native.py \
+            "$GITHUB_WORKSPACE/apps/linux/src-tauri/target/debug/openclaw-desktop" \
+            --ui-root "$WORK_ROOT/assets/before" \
+            --fixture-root "$WORK_ROOT/fixture/before" \
+            --artifacts-dir "$GITHUB_WORKSPACE/$PROOF_ROOT/before" --phase before \
+            2>&1 | tee "$PROOF_ROOT/before.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$status" > "$PROOF_ROOT/before-exit-code.txt"
+          test "$status" -eq 1
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFileSync, readdirSync } from "node:fs";
+          const root = `${process.env.PROOF_ROOT}/before`;
+          const report = JSON.parse(readFileSync(`${root}/result.json`, "utf8"));
+          assert.equal(report.phase, "before");
+          assert.equal(report.status, "expected-regression");
+          assert.equal(report.marker, "assistant-panel-caption-clearance");
+          assert(readdirSync(root, { recursive: true }).includes("assistant-native-before.png"),
+            "The native baseline screenshot must be retained");
+          console.log("Verified native caption-overlap failure, not a setup failure.");
+          NODE
+
+      - name: Prove repaired native panel actions and window behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -p -o "$PROOF_ROOT/after-time.txt" \
+            xvfb-run -a -s '-screen 0 1440x1000x24' dbus-run-session -- \
+            /usr/bin/python3 apps/linux/tests/issue162448_native.py \
+            "$GITHUB_WORKSPACE/apps/linux/src-tauri/target/debug/openclaw-desktop" \
+            --ui-root "$WORK_ROOT/assets/after" \
+            --fixture-root "$WORK_ROOT/fixture/after" \
+            --artifacts-dir "$GITHUB_WORKSPACE/$PROOF_ROOT/after" --phase after \
+            2>&1 | tee "$PROOF_ROOT/after.log"
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFileSync, readdirSync } from "node:fs";
+          const root = `${process.env.PROOF_ROOT}/after`;
+          const report = JSON.parse(readFileSync(`${root}/result.json`, "utf8"));
+          assert.equal(report.phase, "after");
+          assert.equal(report.status, "passed");
+          assert.equal(report.marker, "assistant-panel-caption-clearance");
+          assert(readdirSync(root, { recursive: true }).includes("assistant-native-after.png"),
+            "The repaired native screenshot must be retained");
+          console.log("Verified repaired native panel and window controls.");
+          NODE
+          git diff --check
+          git diff --exit-code "$PRODUCT_SHA" -- ui apps/linux/src-tauri apps/linux/ui apps/linux/scripts crates
+
+      - name: Retain all successful and failed native evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: issue162448-native-${{ github.sha }}-${{ github.run_attempt }}
+          path: .artifacts/issue162448-native/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
