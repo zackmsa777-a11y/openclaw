@@ -2,7 +2,6 @@
 """Fork-only actual Tauri/X11 proof; full UI, synthetic Gateway, no native mocks."""
 
 import argparse
-import html
 import json
 import mimetypes
 import os
@@ -40,22 +39,30 @@ class Handler(QuickChatHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        # The production document anchors all asset URLs at the UI base path.
+        # Do not silently alias deep-route assets into duplicate ES module URLs.
         assets_index = path.find("/assets/")
-        relative = path[assets_index + 1:] if assets_index >= 0 else (path.removeprefix("/fixture/") if path.startswith("/fixture/") else path.lstrip("/"))
+        if assets_index >= 0 and not path.startswith("/fixture/assets/"):
+            self.reply(404)
+            return
+        relative = path.removeprefix("/fixture/") if path.startswith("/fixture/") else path.lstrip("/")
         asset = (self.server.ui_root / relative).resolve()
         if asset.is_relative_to(self.server.ui_root) and asset.is_file():
             if len(self.server.assets_served) < 300:
-                self.server.assets_served.append({"path": relative, "bytes": asset.stat().st_size})
+                self.server.assets_served.append({"requestPath": self.path, "path": relative, "bytes": asset.stat().st_size})
             self.reply(200, asset.read_bytes(), mimetypes.guess_type(str(asset))[0] or "application/octet-stream")
             return
         if assets_index >= 0 or Path(relative).suffix:
             self.reply(404)
             return
         if path.startswith("/fixture/"):
-            document = (self.server.ui_root / "index.html").read_text()
-            document = document.replace("<html", '<html data-openclaw-control-ui-base-path="/fixture" data-openclaw-bootstrap-config="' + html.escape(self.server.bootstrap.decode(), quote=True) + '"', 1)
-            document = document.replace("<head>", '<head><script src="/fixture/mock-gateway.js"></script><script defer src="/fixture/observer.js"></script>', 1)
-            self.reply(200, document.encode(), "text/html; charset=utf-8")
+            document = (self.server.fixture_root / "document.html").read_bytes()
+            self.send_response(200)
+            for name, value in self.server.document_headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(document)))
+            self.end_headers()
+            self.wfile.write(document)
             return
         self.reply(404)
 
@@ -75,6 +82,7 @@ def run_worker(args):
     server.ui_root = args.ui_root
     server.fixture_root = args.fixture_root
     server.bootstrap = (args.fixture_root / "bootstrap.json").read_bytes()
+    server.document_headers = json.loads((args.fixture_root / "document-headers.json").read_text())
     server.workpath = (args.fixture_root / "workpath.txt").read_text().strip()
     server.observation = {}
     server.observation_count = 0

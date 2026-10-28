@@ -2,6 +2,7 @@
 // Control UI production build; this file is not part of the product fix.
 // node --import ./scripts/tsx.mjs apps/linux/tests/issue162448_fixture.mts OUTDIR UIROOT
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -220,9 +221,67 @@ const observer = String.raw`(() => {
 
 mkdirSync(outDir, { recursive: true });
 const workUrl = new URL(controlUiSessionUrl("http://127.0.0.1/fixture", workKey));
+const bootstrap = createControlUiMockBootstrapConfig(scenario);
+const { serveControlUiIndexHtml } = await import(
+  pathToFileURL(path.resolve("src/gateway/control-ui-index.ts")).href
+);
+// Use the production document owner, especially its canonical asset URLs BEFORE
+// deep-link preloads. Serving the same chunks under route-relative aliases gives
+// ES modules different identities and is not the real Gateway's contract.
+const documentSource = html.replace(
+  /<head\b[^>]*>/iu,
+  (tag) =>
+    `${tag}<script src="/fixture/mock-gateway.js"></script><script defer src="/fixture/observer.js"></script>`,
+);
+const documentServer = createServer((request, response) => {
+  void serveControlUiIndexHtml(
+    request,
+    response,
+    documentSource,
+    workUrl.pathname.slice("/fixture".length),
+    "/fixture",
+    false,
+    undefined,
+    identity.buildId,
+    undefined,
+    undefined,
+    false,
+    bootstrap,
+  ).catch((error) => response.destroy(error));
+});
+await new Promise<void>((resolve, reject) => {
+  documentServer.once("error", reject);
+  documentServer.listen(0, "127.0.0.1", resolve);
+});
+let document: string;
+let documentHeaders: Record<string, string>;
+try {
+  const address = documentServer.address();
+  if (!address || typeof address === "string") throw new Error("No document fixture port");
+  const response = await fetch(`http://127.0.0.1:${address.port}${workUrl.pathname}`, {
+    headers: { "accept-encoding": "identity" },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`Document owner returned ${response.status}`);
+  document = await response.text();
+  documentHeaders = Object.fromEntries(
+    ["content-type", "content-security-policy", "cache-control", "link"].flatMap((name) =>
+      response.headers.has(name) ? [[name, response.headers.get(name)!]] : [],
+    ),
+  );
+  if (/\b(?:src|href)="\.\/assets\//u.test(document)) {
+    throw new Error("Production document still contains route-relative bundled asset URLs");
+  }
+} finally {
+  await new Promise<void>((resolve, reject) =>
+    documentServer.close((error) => (error ? reject(error) : resolve())),
+  );
+}
 for (const [name, contents] of Object.entries({
   "mock-gateway.js": createControlUiMockGatewayInitScript(scenario),
-  "bootstrap.json": `${JSON.stringify(createControlUiMockBootstrapConfig(scenario), null, 2)}\n`,
+  "bootstrap.json": `${JSON.stringify(bootstrap, null, 2)}\n`,
+  "document.html": document,
+  "document-headers.json": `${JSON.stringify(documentHeaders, null, 2)}\n`,
   "observer.js": observer,
   "workpath.txt": `${workUrl.pathname}${workUrl.search}\n`,
 })) {
