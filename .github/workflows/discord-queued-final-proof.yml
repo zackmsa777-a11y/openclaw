@@ -1,0 +1,68 @@
+name: Discord queued-final isolated proof
+on:
+  push:
+    branches: [test/discord-queued-final-proof-20261028]
+permissions:
+  contents: read
+jobs:
+  proof:
+    if: github.repository == 'zackmsa777-a11y/openclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout isolated proof branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.19.0'
+          package-manager-cache: false
+      - name: Install pinned package manager and dependencies without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/proof-home"
+          export HOME="$RUNNER_TEMP/proof-home"
+          npm install --global pnpm@12.3.4
+          pnpm install --frozen-lockfile
+      - name: Candidate regression and seven owner suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/proof-home"
+          export OPENCLAW_VITEST_MAX_WORKERS=2
+          node scripts/run-vitest.mjs \
+            src/auto-reply/reply/followup-delivery.discord-overlap.test.ts \
+            src/auto-reply/reply/followup-delivery.test.ts \
+            src/auto-reply/reply/followup-delivery.channel.test.ts \
+            src/auto-reply/reply/followup-delivery.implicit-reply.test.ts \
+            src/auto-reply/reply/followup-delivery-payloads.test.ts \
+            src/auto-reply/reply/followup-turn-admission.test.ts \
+            src/auto-reply/reply/reply-plumbing.test.ts \
+            src/auto-reply/reply/reply-threading.test.ts
+      - name: Compare identical regression against pinned current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/proof-home"
+          export OPENCLAW_VITEST_MAX_WORKERS=2
+          export OPENCLAW_VITEST_FS_MODULE_CACHE_PATH="$RUNNER_TEMP/baseline-vitest-cache"
+          git fetch --depth=1 https://github.com/openclaw/openclaw.git e2b0e2b313b0b4fec1857dcad8d8dc0be8fd9716
+          git worktree add --detach "$RUNNER_TEMP/discord-proof-base" FETCH_HEAD
+          cp src/auto-reply/reply/followup-delivery.discord-overlap.test.ts "$RUNNER_TEMP/discord-proof-base/src/auto-reply/reply/"
+          cd "$RUNNER_TEMP/discord-proof-base"
+          pnpm install --frozen-lockfile
+          set +e
+          node scripts/run-vitest.mjs src/auto-reply/reply/followup-delivery.discord-overlap.test.ts > "$RUNNER_TEMP/baseline-proof.log" 2>&1
+          result=$?
+          set -e
+          sed -i -E 's/\x1B\[[0-9;]*[mK]//g' "$RUNNER_TEMP/baseline-proof.log"
+          cat "$RUNNER_TEMP/baseline-proof.log"
+          # A startup/import failure is NOT a reproduced regression.
+          test "$result" -ne 0
+          grep -q 'AssertionError' "$RUNNER_TEMP/baseline-proof.log"
+          grep -q 'discord-message-B' "$RUNNER_TEMP/baseline-proof.log"
+          grep -Eq '1 failed.*2 passed' "$RUNNER_TEMP/baseline-proof.log"
+          echo 'BASELINE_REGRESSION_CONFIRMED: final B/C references missing; controls passed.'
