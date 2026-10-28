@@ -60,7 +60,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            at-spi2-core build-essential curl dbus-x11 ffmpeg file fonts-dejavu-core \
+            at-spi2-core build-essential curl dbus-x11 ffmpeg file fonts-dejavu-core gdb \
             gir1.2-atspi-2.0 gnome-keyring imagemagick libatk-adaptor \
             libayatana-appindicator3-dev libegl1 libgles2 librsvg2-dev \
             libssl-dev libwebkit2gtk-4.1-dev libxdo-dev openbox patchelf \
@@ -152,6 +152,7 @@ jobs:
           done
 
       - name: Prepare synthetic Gateway data without replacing native chrome
+        id: fixtures
         shell: bash
         run: |
           set -euo pipefail
@@ -195,6 +196,9 @@ jobs:
           NODE
 
       - name: Prove repaired native panel actions and window behavior
+        # Still run the fixed candidate to distinguish CSS from shared runtime
+        # setup failures. A failed baseline remains a failed job; no gate waived.
+        if: ${{ !cancelled() && steps.fixtures.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail

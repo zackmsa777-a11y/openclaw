@@ -347,6 +347,17 @@ def run_worker(args):
             # Only this task-private session; no argv, environment or credentials.
             result["processState"] = chrome.command(
                 "ps", "--sid", str(os.getsid(0)), "-o", "pid,ppid,stat,pcpu,wchan:40,comm")
+            result["ptraceScope"] = Path("/proc/sys/kernel/yama/ptrace_scope").read_text().strip()
+            # Keep the worker's ancestor PID when executing GDB below. A sibling
+            # GDB subprocess is not permitted to attach under ordinary Yama=1.
+            # Never change Yama, dumpability, capabilities or sandbox settings.
+            processes = chrome.command("ps", "--sid", str(os.getsid(0)), "-o", "pid=,comm=")
+            for line in processes.splitlines():
+                pid, command = line.split(None, 1)
+                if command != "WebKitWebProces":
+                    continue
+                result["stackDiagnostic"] = {"pid": int(pid), "method": "same-ancestor-exec-gdb"}
+                break
         except BaseException as diagnostic_error:
             result["processStateError"] = type(diagnostic_error).__name__
         try:
@@ -368,6 +379,23 @@ def run_worker(args):
         result["nativeRequests"] = server.native_requests
         result["assetsServed"] = server.assets_served
         (args.artifacts_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+        if result.get("stackDiagnostic"):
+            # Only after failure, screenshots, video and JSON are durable. Exec
+            # preserves ordinary parent/descendant inspection authority; the
+            # outer supervisor still owns timeout and private process cleanup.
+            # SIGALRM survives exec and bounds this diagnostic to 15 seconds.
+            with (args.artifacts_dir / "webkit-stack.txt").open("wb") as stack:
+                print("Capturing failed WebKit stack under ordinary ancestor permissions", flush=True)
+                os.dup2(stack.fileno(), sys.stdout.fileno())
+                os.dup2(stack.fileno(), sys.stderr.fileno())
+                signal.alarm(15)
+                os.execvp("gdb", [
+                    "gdb", "--quiet", "--nx", "--nh", "--batch",
+                    "-iex", "set auto-load off", "-iex", "set debuginfod enabled off",
+                    "-iex", "set print frame-arguments none",
+                    "-p", str(result["stackDiagnostic"]["pid"]), "-ex", "set pagination off",
+                    "-ex", "thread apply all bt 24", "-ex", "detach", "-ex", "quit 2",
+                ])
         if app is not None and app.poll() is None:
             app.terminate()
             try:
@@ -422,7 +450,17 @@ def main():
                    "--ui-root", str(args.ui_root), "--fixture-root", str(args.fixture_root), "--artifacts-dir", str(args.artifacts_dir)]
         worker = subprocess.Popen(command, cwd=root, env=env, stdin=subprocess.DEVNULL, start_new_session=True)
         try:
-            return worker.wait(timeout=240)
+            status = worker.wait(timeout=240)
+            report_path = args.artifacts_dir / "result.json"
+            if report_path.is_file():
+                report = json.loads(report_path.read_text())
+                if report.get("stackDiagnostic"):
+                    report["stackDiagnostic"]["exitCode"] = status
+                    report_path.write_text(json.dumps(report, indent=2) + "\n")
+                # A successful debugger exit is NOT a successful scenario.
+                if report.get("status") == "failed":
+                    return 2
+            return status
         finally:
             try:
                 os.killpg(worker.pid, signal.SIGTERM)
