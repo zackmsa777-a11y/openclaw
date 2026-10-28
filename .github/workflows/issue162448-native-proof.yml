@@ -23,7 +23,7 @@ jobs:
       BASE_SHA: 8889b596023c846cc9076078a000c25715f0ecf0
       CSS_PATH: ui/src/styles/assistant-panel.css
       PROOF_ROOT: .artifacts/issue162448-native
-      WORK_ROOT: ${{ runner.temp }}/issue162448-native
+      WORK_ROOT: /tmp/issue162448-native-${{ github.run_id }}
       CARGO_BUILD_JOBS: "2"
       # Keep the ordinary debug build; omit symbols to bound cold build cost.
       CARGO_PROFILE_DEV_DEBUG: "0"
