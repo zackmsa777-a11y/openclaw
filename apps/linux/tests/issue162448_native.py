@@ -15,21 +15,18 @@ import time
 import traceback
 from urllib.parse import unquote, urlsplit
 
-from inline_browser import FixtureHandler, GatewayFixture
+from issue162448_native_gateway import NativeGatewayFixture, QuickChatHandler
 from window_chrome import WindowChromeFixture
 
 
 MARKER = "assistant-panel-caption-clearance"
 
 
-class Handler(FixtureHandler):
+class Handler(QuickChatHandler):
     def do_GET(self):
         path = unquote(urlsplit(self.path).path)
-        if self.headers.get("Upgrade"):
-            # Native background RPC is outside this UI geometry fixture. The
-            # production dashboard uses the repository's synthetic Gateway owner.
-            self.reply(501)
-            return
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            return super().do_GET()
         if path.endswith("/control-ui-config.json"):
             self.reply(200, self.server.bootstrap, "application/json")
             return
@@ -71,7 +68,7 @@ class Handler(FixtureHandler):
 
 
 def run_worker(args):
-    server = GatewayFixture(args.artifacts_dir)
+    server = NativeGatewayFixture(args.artifacts_dir)
     server.RequestHandlerClass = Handler
     server.ui_root = args.ui_root
     server.fixture_root = args.fixture_root
@@ -91,6 +88,8 @@ def run_worker(args):
     def wait(predicate, description, timeout=40):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if server.failure:
+                raise RuntimeError("Synthetic native Gateway: " + server.failure)
             if app is not None and app.poll() is not None:
                 raise RuntimeError("Native app exited while waiting for " + description)
             value = predicate()
@@ -247,6 +246,7 @@ def run_worker(args):
         return 2
     finally:
         result["observationCount"] = server.observation_count
+        result["nativeRequests"] = server.native_requests
         (args.artifacts_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         if app is not None and app.poll() is None:
             app.terminate()
