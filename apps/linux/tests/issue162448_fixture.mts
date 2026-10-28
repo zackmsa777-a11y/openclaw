@@ -75,12 +75,19 @@ const observer = String.raw`(() => {
   const inputs = [];
   const animationFrame = () => { animationFrames++; requestAnimationFrame(animationFrame); };
   requestAnimationFrame(animationFrame);
-  window.addEventListener("click", (event) => {
-    if (!event.isTrusted || inputs.length >= 50) return;
-    const target = event.target instanceof Element ? event.target.closest("button") : null;
-    inputs.push({ type: event.type, label: target ? target.getAttribute("aria-label") || target.textContent?.trim().slice(0,80) : null,
-      x: event.clientX, y: event.clientY });
+  let lastPointerMove = null;
+  let pointerMoveSequence = 0;
+  window.addEventListener("pointermove", (event) => {
+    if (event.isTrusted) lastPointerMove = { sequence: ++pointerMoveSequence, x: event.clientX, y: event.clientY };
   }, true);
+  for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+    window.addEventListener(type, (event) => {
+      if (!event.isTrusted || inputs.length >= 200) return;
+      const target = event.target instanceof Element ? event.target.closest("button") : null;
+      inputs.push({ type: event.type, label: target ? target.getAttribute("aria-label") || target.textContent?.trim().slice(0,80) : null,
+        x: event.clientX, y: event.clientY, button: event.button });
+    }, true);
+  }
   const compact = (value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, 180);
   const safeMessage = (value) => compact(value)
     .replace(/https?:\/\/[^\s]+/gi, "[url]")
@@ -138,6 +145,7 @@ const observer = String.raw`(() => {
       documentFocused: document.hasFocus(),
       animationFrames,
       trustedInputs: inputs.slice(),
+      lastPointerMove,
       document: { width: document.documentElement.clientWidth, height: document.documentElement.clientHeight },
       viewport: { width: innerWidth, height: innerHeight, devicePixelRatio },
       window: { innerWidth, innerHeight, outerWidth, outerHeight, screenX, screenY },

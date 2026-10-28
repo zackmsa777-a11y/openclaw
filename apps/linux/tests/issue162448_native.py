@@ -78,6 +78,8 @@ def run_worker(args):
     server.observation_count = 0
     chrome = WindowChromeFixture(args.artifacts_dir)
     app = None
+    video = None
+    video_log = None
     server_started = False
     result = {"phase": args.phase, "status": "failed", "marker": MARKER, "checks": [],
               "rendering": {"backend": os.environ.get("GDK_BACKEND"),
@@ -114,15 +116,74 @@ def run_worker(args):
         value = observation().get("controls", {}).get(name, {})
         return value if value.get("visible") and not value.get("disabled") else None
 
-    def click(name):
-        button = wait(lambda: control(name), "visible " + name)
+    def active_window():
+        return int(chrome.command("xprop", "-root", "_NET_ACTIVE_WINDOW").split()[-1], 16)
+
+    def click(name, *, allow_covered=False):
         window = wait(find_window, "native window")
-        window_box = chrome.geometry(window)
+        chrome.command("wmctrl", "-ia", window)
+        wait(lambda: active_window() == int(window, 16), "native active-window receipt")
+        initial_sequence = observation().get("sequence", 0)
+        initial_frames = observation().get("animationFrames", 0)
+        previous = None
+        previous_sequence = initial_sequence
+        stable = 0
+
+        def settled_target():
+            nonlocal previous, previous_sequence, stable
+            snap = observation()
+            if snap.get("sequence", 0) <= previous_sequence:
+                return None
+            previous_sequence = snap["sequence"]
+            button = snap.get("controls", {}).get(name)
+            if not button or not button.get("visible") or button.get("disabled"):
+                return None
+            bounds = chrome.geometry(window)
+            if (not button or not snap.get("documentFocused") or snap.get("visibilityState") != "visible"
+                    or snap.get("sequence", 0) <= initial_sequence
+                    or snap.get("animationFrames", 0) <= initial_frames
+                    or (not allow_covered and not button["clickableAtCenter"])):
+                return None
+            view = snap["window"]
+            if (view["screenX"], view["screenY"], view["innerWidth"], view["innerHeight"]) != (
+                    bounds["x"], bounds["y"], bounds["width"], bounds["height"]):
+                return None
+            current = (bounds, button["rect"])
+            stable = stable + 1 if current == previous else 0
+            previous = current
+            return (snap, button, bounds) if stable >= 2 else None
+
+        snap, button, window_box = wait(settled_target, "focused, settled native target " + name)
         box = button["rect"]
+        x = round(window_box["x"] + box["x"] + box["width"] / 2)
+        y = round(window_box["y"] + box["y"] + box["height"] / 2)
+        previous_move = (snap.get("lastPointerMove") or {}).get("sequence", 0)
+        pointer = lambda: dict(line.split("=", 1) for line in chrome.command(
+            "xdotool", "getmouselocation", "--shell").splitlines())
+        prior = pointer()
+        if (int(prior["X"]), int(prior["Y"])) == (x, y):
+            chrome.command("xdotool", "mousemove", str(x + 2), str(y))
+            move = wait(lambda: (move := observation().get("lastPointerMove"))
+                        and move["sequence"] > previous_move
+                        and abs(move["x"] - (x + 2 - window_box["x"])) <= 1 and move,
+                        "trusted pointer nudge before " + name, timeout=10)
+            previous_move = move["sequence"]
+        chrome.command("xdotool", "mousemove", str(x), str(y))
+        location = pointer()
+        assert (int(location["X"]), int(location["Y"])) == (x, y), "XTest pointer did not reach target"
+        wait(lambda: (move := observation().get("lastPointerMove"))
+             and move["sequence"] > previous_move
+             and abs(move["x"] - (x - window_box["x"])) <= 1
+             and abs(move["y"] - (y - window_box["y"])) <= 1,
+             "trusted native pointer movement at " + name, timeout=10)
         record("pointer-click", {"control": name, "label": button["label"],
-                                "snapshotSequence": observation().get("sequence"), "rect": box})
-        chrome.command("xdotool", "mousemove", "--sync", str(round(window_box["x"] + box["x"] + box["width"] / 2)),
-                       str(round(window_box["y"] + box["y"] + box["height"] / 2)), "click", "1")
+                                "snapshotSequence": observation().get("sequence"), "rect": box,
+                                "window": window, "windowBounds": window_box,
+                                "activeWindow": active_window(), "pointer": location})
+        if name == "homeFooter" and not result.get("initialReadyScreenshot"):
+            result["initialReadyScreenshot"] = screenshot(args.phase + "-ready")
+        # XTest against the actual pointer; never XSendEvent or a DOM click.
+        chrome.command("xdotool", "click", "1")
 
     def panel_visible():
         return observation().get("panel", {}).get("visible", False)
@@ -172,6 +233,13 @@ def run_worker(args):
         chrome.start()
         server.start()
         server_started = True
+        video_log = (args.artifacts_dir / "video.log").open("wb")
+        video = subprocess.Popen([
+            "ffmpeg", "-y", "-loglevel", "warning", "-f", "x11grab", "-framerate", "10",
+            "-video_size", "1440x1000", "-i", os.environ["DISPLAY"], "-an",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+            str(args.artifacts_dir / "native-interactions.mp4"),
+        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=video_log)
         with Path("app.log").open("wb") as log:
             app = subprocess.Popen([str(args.binary)], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         wait(lambda: control("homeFooter") and control("maximize"), "full Control UI and real native caption", timeout=75)
@@ -190,7 +258,7 @@ def run_worker(args):
         if args.phase == "before":
             if not collisions:
                 raise RuntimeError("Original stylesheet did not reproduce caption overlap")
-            click("panelClose")
+            click("panelClose", allow_covered=True)
             wait(lambda: not find_window(), "covered panel-close click to hide native window")
             record("covered-panel-close-hid-native-window", True)
             result["status"] = "expected-regression"
@@ -258,6 +326,15 @@ def run_worker(args):
             pass
         return 2
     finally:
+        if video is not None:
+            try:
+                video.communicate(b"q\n", timeout=5)
+            except subprocess.TimeoutExpired:
+                video.kill()
+                video.wait(timeout=5)
+            result["videoExitCode"] = video.returncode
+        if video_log is not None:
+            video_log.close()
         result["observationCount"] = server.observation_count
         result["nativeRequests"] = server.native_requests
         (args.artifacts_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")

@@ -60,7 +60,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            at-spi2-core build-essential curl dbus-x11 file fonts-dejavu-core \
+            at-spi2-core build-essential curl dbus-x11 ffmpeg file fonts-dejavu-core \
             gir1.2-atspi-2.0 gnome-keyring imagemagick libatk-adaptor \
             libayatana-appindicator3-dev libegl1 libgles2 librsvg2-dev \
             libssl-dev libwebkit2gtk-4.1-dev libxdo-dev openbox patchelf \
@@ -75,6 +75,7 @@ jobs:
           node-version: 24.22.1
 
       - name: Install pinned JavaScript dependencies and stable Rust
+        id: toolchains
         shell: bash
         run: |
           set -euo pipefail
@@ -82,12 +83,23 @@ jobs:
           test "$(corepack pnpm --version)" = "12.15.0"
           corepack pnpm install --frozen-lockfile
           rustup toolchain install stable --profile minimal
+          printf 'rustc-hash=%s\n' "$(rustc +stable --version --verbose | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
           {
             node --version
             corepack pnpm --version
             rustc +stable --version --verbose
             cargo +stable --version
           } >> "$PROOF_ROOT/identity.txt"
+
+      - name: Restore this product's native Cargo build
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/linux/src-tauri/target
+          key: issue162448-native-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu22.04-${{ env.PRODUCT_SHA }}-${{ steps.toolchains.outputs.rustc-hash }}-${{ hashFiles('apps/linux/src-tauri/Cargo.lock', 'apps/linux/tests/stage_onboarding_runtime.py', 'apps/linux/tests/fixtures/onboarding-cli.mjs') }}-debug${{ env.CARGO_PROFILE_DEV_DEBUG }}
 
       - name: Build one native candidate with the upstream synthetic runtime
         working-directory: apps/linux/src-tauri
@@ -101,6 +113,16 @@ jobs:
             2>&1 | tee "$GITHUB_WORKSPACE/$PROOF_ROOT/native-build.log"
           sha256sum target/debug/openclaw-desktop \
             >> "$GITHUB_WORKSPACE/$PROOF_ROOT/identity.txt"
+
+      - name: Retain successful native compilation before exercising the harness
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/linux/src-tauri/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Build original and repaired full Control UI assets
         shell: bash
