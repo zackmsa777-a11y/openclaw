@@ -1,0 +1,144 @@
+# Fork-only proof harness. Do not include this file in the upstream pull request.
+name: Linux assistant caption clearance proof
+
+on:
+  push:
+    branches: [test/linux-assistant-caption-clearance-162448]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue162448-proof-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  browser-proof:
+    if: github.repository == 'zackmsa777-a11y/openclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CI: "true"
+      OPENCLAW_VITEST_RUNTIME: node
+      OPENCLAW_UI_E2E_SKIP_REAL_GATEWAY: "1"
+      BASE_SHA: 8889b596023c846cc9076078a000c25715f0ecf0
+      CSS_PATH: ui/src/styles/assistant-panel.css
+      PROOF_ROOT: .artifacts/issue162448
+    steps:
+      - name: Check out exact proof candidate without retained credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the supported Node runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.1
+
+      - name: Install pinned dependencies and managed Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          test "$(corepack pnpm --version)" = "12.15.0"
+          corepack pnpm install --frozen-lockfile
+          node --import ./scripts/tsx.mjs scripts/ensure-playwright-chromium.mts --require-playwright-chromium
+
+      - name: Record candidate and acquire the immutable public baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROOF_ROOT/before" "$PROOF_ROOT/after"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 https://github.com/openclaw/openclaw.git "$BASE_SHA"
+          git cat-file -e "$BASE_SHA:$CSS_PATH"
+          {
+            printf 'candidate=%s\nbaseline=%s\n' "$GITHUB_SHA" "$BASE_SHA"
+            node --version
+            corepack pnpm --version
+            sha256sum "$CSS_PATH" ui/src/e2e/native-desktop-titlebar.e2e.test.ts
+          } > "$PROOF_ROOT/identity.txt"
+
+      - name: Prove the exact regression fails on the original stylesheet
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'git show "$GITHUB_SHA:$CSS_PATH" > "$CSS_PATH"' EXIT
+          git show "$BASE_SHA:$CSS_PATH" > "$CSS_PATH"
+          export OPENCLAW_UI_E2E_ARTIFACT_DIR="$GITHUB_WORKSPACE/$PROOF_ROOT/before"
+          set +e
+          /usr/bin/time -p -o "$PROOF_ROOT/before-time.txt" \
+            node scripts/run-vitest.mjs run \
+            --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner \
+            ui/src/e2e/native-desktop-titlebar.e2e.test.ts \
+            -t 'Home / Ask OpenClaw' --maxWorkers=1 \
+            --reporter=default --reporter=json --outputFile="$PROOF_ROOT/before.json" \
+            2>&1 | tee "$PROOF_ROOT/before.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$status" > "$PROOF_ROOT/before-exit-code.txt"
+          test "$status" -ne 0
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFileSync, readdirSync } from "node:fs";
+          const root = process.env.PROOF_ROOT;
+          const report = JSON.parse(readFileSync(`${root}/before.json`, "utf8"));
+          const failures = report.testResults.flatMap((suite) => suite.assertionResults)
+            .filter((test) => test.status === "failed");
+          assert.equal(report.numFailedTests, 1, "Expected exactly one failed regression");
+          assert.equal(failures.length, 1, "Setup failures are not a regression result");
+          assert.equal(failures[0].title,
+            "keeps the Home / Ask OpenClaw assistant actions clear of Linux window controls");
+          assert.match(failures[0].failureMessages.join("\n"),
+            /assistant-panel-caption-clearance/u,
+            "The baseline must fail at caption clearance, not fixture setup");
+          assert(readdirSync(`${root}/before`, { recursive: true })
+            .some((file) => file.endsWith("linux-assistant-right.png")),
+            "The baseline screenshot must be retained");
+          console.log("Verified baseline failure at the caption-clearance assertion.");
+          NODE
+
+      - name: Prove repaired titlebar and assistant-toggle flows
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- "$CSS_PATH"
+          export OPENCLAW_UI_E2E_ARTIFACT_DIR="$GITHUB_WORKSPACE/$PROOF_ROOT/after"
+          /usr/bin/time -p -o "$PROOF_ROOT/after-time.txt" \
+            node scripts/run-vitest.mjs run \
+            --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner \
+            ui/src/e2e/native-desktop-titlebar.e2e.test.ts \
+            ui/src/e2e/custodian-panel-toggle.e2e.test.ts \
+            --maxWorkers=1 --reporter=default --reporter=json \
+            --outputFile="$PROOF_ROOT/after.json" 2>&1 | tee "$PROOF_ROOT/after.log"
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFileSync, readdirSync } from "node:fs";
+          const root = process.env.PROOF_ROOT;
+          const report = JSON.parse(readFileSync(`${root}/after.json`, "utf8"));
+          assert.equal(report.success, true);
+          assert.equal(report.numFailedTests, 0);
+          const tests = report.testResults.flatMap((suite) => suite.assertionResults);
+          const regression = tests.find((test) => test.title ===
+            "keeps the Home / Ask OpenClaw assistant actions clear of Linux window controls");
+          assert.equal(regression?.status, "passed", "The regression must run, not skip");
+          assert.equal(tests.filter((test) => test.status !== "passed").length, 0,
+            "All selected sibling tests must run and pass");
+          assert(readdirSync(`${root}/after`, { recursive: true })
+            .some((file) => file.endsWith("linux-assistant-right.png")),
+            "The repaired screenshot must be retained");
+          console.log(`Verified ${report.numPassedTests} repaired/sibling tests passed.`);
+          NODE
+          git diff --check
+
+      - name: Retain successful and failed evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: issue162448-${{ github.sha }}-${{ github.run_attempt }}
+          path: .artifacts/issue162448/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
