@@ -165,6 +165,9 @@ const observer = String.raw`(() => {
       headerButtons: Array.from(header ? header.querySelectorAll("button") : [], describe),
       controls: {
         homeFooter: describe(document.querySelector(".sidebar-footer-bar__home")),
+        paletteInput: describe(document.querySelector("#cmd-palette-input")),
+        paletteAsk: describe(Array.from(document.querySelectorAll('.cmd-palette__item[role="option"]'))
+          .find(element => element.querySelector(".cmd-palette__item-title")?.textContent?.trim() === "Ask OpenClaw")),
         expandSidebar: describe(button(document.querySelector(".shell-chrome-controls"), "Expand sidebar")),
         maximize: describe(caption && caption.querySelector('[data-action="toggle-maximize"]')),
         minimize: describe(caption && caption.querySelector('[data-action="minimize"]')),
@@ -176,6 +179,15 @@ const observer = String.raw`(() => {
         dockRight: describe(button(panel, "Dock assistant sidebar at right")),
         divider: describe(panel && panel.querySelector('[role="separator"][aria-label="Resize assistant sidebar"]')),
       },
+      lazyContent: {
+        defined: Boolean(customElements.get("openclaw-assistant-panel-content")),
+        homeSessions: panel ? panel.querySelectorAll("openclaw-home-session").length : 0,
+        contexts: panel ? panel.querySelectorAll(".assistant-panel-context").length : 0,
+        chatPanes: panel ? panel.querySelectorAll("openclaw-chat-pane").length : 0,
+        loaders: panel ? panel.querySelectorAll(".assistant-panel-loading").length : 0,
+      },
+      gatewayMethods: (window.openclawControlUiE2eGateway?.requests || []).slice(-80).map(request => request.method),
+      paletteQuery: document.querySelector("#cmd-palette-input")?.value || "",
       errors: errors.slice(),
     };
   };

@@ -44,6 +44,8 @@ class Handler(QuickChatHandler):
         relative = path[assets_index + 1:] if assets_index >= 0 else (path.removeprefix("/fixture/") if path.startswith("/fixture/") else path.lstrip("/"))
         asset = (self.server.ui_root / relative).resolve()
         if asset.is_relative_to(self.server.ui_root) and asset.is_file():
+            if len(self.server.assets_served) < 300:
+                self.server.assets_served.append({"path": relative, "bytes": asset.stat().st_size})
             self.reply(200, asset.read_bytes(), mimetypes.guess_type(str(asset))[0] or "application/octet-stream")
             return
         if assets_index >= 0 or Path(relative).suffix:
@@ -76,6 +78,7 @@ def run_worker(args):
     server.workpath = (args.fixture_root / "workpath.txt").read_text().strip()
     server.observation = {}
     server.observation_count = 0
+    server.assets_served = []
     chrome = WindowChromeFixture(args.artifacts_dir)
     app = None
     video = None
@@ -145,8 +148,9 @@ def run_worker(args):
                     or (not allow_covered and not button["clickableAtCenter"])):
                 return None
             view = snap["window"]
-            if (view["screenX"], view["screenY"], view["innerWidth"], view["innerHeight"]) != (
-                    bounds["x"], bounds["y"], bounds["width"], bounds["height"]):
+            # Native modal chrome may add an OS frame: screenX/Y can name its
+            # outer origin, whereas xwininfo correctly measures the WebView client.
+            if (view["innerWidth"], view["innerHeight"]) != (bounds["width"], bounds["height"]):
                 return None
             current = (bounds, button["rect"])
             stable = stable + 1 if current == previous else 0
@@ -180,7 +184,7 @@ def run_worker(args):
                                 "snapshotSequence": observation().get("sequence"), "rect": box,
                                 "window": window, "windowBounds": window_box,
                                 "activeWindow": active_window(), "pointer": location})
-        if name == "homeFooter" and not result.get("initialReadyScreenshot"):
+        if name == "paletteAsk" and not result.get("initialReadyScreenshot"):
             result["initialReadyScreenshot"] = screenshot(args.phase + "-ready")
         # XTest against the actual pointer; never XSendEvent or a DOM click.
         chrome.command("xdotool", "click", "1")
@@ -189,14 +193,31 @@ def run_worker(args):
         return observation().get("panel", {}).get("visible", False)
 
     def open_panel():
-        click("homeFooter")
-        wait(panel_visible, "Home assistant panel")
-        # Opening Home and collapsing navigation have separate DOM commits.
-        # Match the canonical browser regression: await the Expand control itself.
-        wait(lambda: control("expandSidebar") and control("expandSidebar")["clickableAtCenter"],
-             "hittable Expand sidebar after Home opens")
-        click("expandSidebar")
-        wait(lambda: "shell--nav-collapsed" not in observation().get("shellClasses", "") and control("panelClose"), "expanded regular navigation")
+        # User-facing palette command opens this SAME Home/Ask panel, not Side chat.
+        # Home content currently hangs in the synthetic native fixture; preserve
+        # that gap instead of bypassing it with a synthetic event or DOM click.
+        window = wait(find_window, "native window")
+        sequence = observation().get("sequence", 0)
+        frames = observation().get("animationFrames", 0)
+        chrome.command("wmctrl", "-ia", window)
+        wait(lambda: active_window() == int(window, 16) and observation().get("documentFocused")
+             and observation().get("sequence", 0) > sequence
+             and observation().get("animationFrames", 0) > frames,
+             "fresh focused window for command palette")
+        chrome.command("xdotool", "key", "--clearmodifiers", "ctrl+k")
+        wait(lambda: control("paletteInput"), "real command palette")
+        click("paletteInput")
+        chrome.command("xdotool", "key", "--clearmodifiers", "ctrl+a")
+        chrome.command("xdotool", "type", "--clearmodifiers", "--delay", "35", "openclaw")
+        wait(lambda: observation().get("paletteQuery") == "openclaw" and control("paletteAsk"),
+             "Ask OpenClaw palette result")
+        click("paletteAsk")
+        wait(lambda: panel_visible() and observation().get("activePanelMode") == "custodian",
+             "Ask OpenClaw assistant panel")
+        if "shell--nav-collapsed" in observation().get("shellClasses", ""):
+            click("expandSidebar")
+        wait(lambda: "shell--nav-collapsed" not in observation().get("shellClasses", "") and control("panelClose"),
+             "expanded regular navigation")
         assert "shell--mobile-nav" not in observation().get("shellClasses", ""), "Expected regular desktop navigation"
         assert "assistant-panel--right" in observation()["panel"]["className"], "Expected right-docked assistant"
 
@@ -337,6 +358,7 @@ def run_worker(args):
             video_log.close()
         result["observationCount"] = server.observation_count
         result["nativeRequests"] = server.native_requests
+        result["assetsServed"] = server.assets_served
         (args.artifacts_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         if app is not None and app.poll() is None:
             app.terminate()
