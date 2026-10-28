@@ -117,7 +117,9 @@ def run_worker(args):
         window = wait(find_window, "native window")
         window_box = chrome.geometry(window)
         box = button["rect"]
-        chrome.command("xdotool", "mousemove", str(round(window_box["x"] + box["x"] + box["width"] / 2)),
+        record("pointer-click", {"control": name, "label": button["label"],
+                                "snapshotSequence": observation().get("sequence"), "rect": box})
+        chrome.command("xdotool", "mousemove", "--sync", str(round(window_box["x"] + box["x"] + box["width"] / 2)),
                        str(round(window_box["y"] + box["y"] + box["height"] / 2)), "click", "1")
 
     def panel_visible():
@@ -126,8 +128,11 @@ def run_worker(args):
     def open_panel():
         click("homeFooter")
         wait(panel_visible, "Home assistant panel")
-        if "shell--nav-collapsed" in observation().get("shellClasses", ""):
-            click("expandSidebar")
+        # Opening Home and collapsing navigation have separate DOM commits.
+        # Match the canonical browser regression: await the Expand control itself.
+        wait(lambda: control("expandSidebar") and control("expandSidebar")["clickableAtCenter"],
+             "hittable Expand sidebar after Home opens")
+        click("expandSidebar")
         wait(lambda: "shell--nav-collapsed" not in observation().get("shellClasses", "") and control("panelClose"), "expanded regular navigation")
         assert "shell--mobile-nav" not in observation().get("shellClasses", ""), "Expected regular desktop navigation"
         assert "assistant-panel--right" in observation()["panel"]["className"], "Expected right-docked assistant"

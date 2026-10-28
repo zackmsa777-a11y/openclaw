@@ -70,6 +70,17 @@ const observer = String.raw`(() => {
   let lastSnapshot = "";
   let posting = false;
   let sequence = 0;
+  let lastPostedAt = 0;
+  let animationFrames = 0;
+  const inputs = [];
+  const animationFrame = () => { animationFrames++; requestAnimationFrame(animationFrame); };
+  requestAnimationFrame(animationFrame);
+  window.addEventListener("click", (event) => {
+    if (!event.isTrusted || inputs.length >= 50) return;
+    const target = event.target instanceof Element ? event.target.closest("button") : null;
+    inputs.push({ type: event.type, label: target ? target.getAttribute("aria-label") || target.textContent?.trim().slice(0,80) : null,
+      x: event.clientX, y: event.clientY });
+  }, true);
   const compact = (value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, 180);
   const safeMessage = (value) => compact(value)
     .replace(/https?:\/\/[^\s]+/gi, "[url]")
@@ -123,6 +134,10 @@ const observer = String.raw`(() => {
       schemaVersion: 1,
       pathname: location.pathname,
       readyState: document.readyState,
+      visibilityState: document.visibilityState,
+      documentFocused: document.hasFocus(),
+      animationFrames,
+      trustedInputs: inputs.slice(),
       document: { width: document.documentElement.clientWidth, height: document.documentElement.clientHeight },
       viewport: { width: innerWidth, height: innerHeight, devicePixelRatio },
       window: { innerWidth, innerHeight, outerWidth, outerHeight, screenX, screenY },
@@ -165,7 +180,7 @@ const observer = String.raw`(() => {
       return;
     }
     const serialized = JSON.stringify(snapshot);
-    if (serialized === lastSnapshot) return;
+    if (serialized === lastSnapshot && Date.now() - lastPostedAt < 1000) return;
     posting = true;
     try {
       const response = await fetch("/fixture/proof", {
@@ -173,7 +188,7 @@ const observer = String.raw`(() => {
         credentials: "omit", cache: "no-store",
         body: JSON.stringify({ ...snapshot, sequence: ++sequence, observedAt: Date.now() }),
       });
-      if (response.ok) lastSnapshot = serialized;
+      if (response.ok) { lastSnapshot = serialized; lastPostedAt = Date.now(); }
     } catch { /* A failed local receipt is retried at the next observation. */ }
     finally { posting = false; }
   };
