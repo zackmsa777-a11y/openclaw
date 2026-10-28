@@ -79,7 +79,9 @@ def run_worker(args):
     chrome = WindowChromeFixture(args.artifacts_dir)
     app = None
     server_started = False
-    result = {"phase": args.phase, "status": "failed", "marker": MARKER, "checks": []}
+    result = {"phase": args.phase, "status": "failed", "marker": MARKER, "checks": [],
+              "rendering": {"backend": os.environ.get("GDK_BACKEND"),
+                            "WEBKIT_DISABLE_COMPOSITING_MODE": os.environ.get("WEBKIT_DISABLE_COMPOSITING_MODE")}}
 
     def record(name, value=True):
         result["checks"].append({"name": name, "value": value})
@@ -245,6 +247,12 @@ def run_worker(args):
         result["lastObservation"] = observation()
         traceback.print_exc()
         try:
+            # Only this task-private session; no argv, environment or credentials.
+            result["processState"] = chrome.command(
+                "ps", "--sid", str(os.getsid(0)), "-o", "pid,ppid,stat,pcpu,wchan:40,comm")
+        except BaseException as diagnostic_error:
+            result["processStateError"] = type(diagnostic_error).__name__
+        try:
             screenshot(args.phase + "-failed")
         except BaseException:
             pass
@@ -293,6 +301,11 @@ def main():
         env = {key: os.environ[key] for key in ("DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY") if key in os.environ}
         env.update(HOME=str(root), PATH="/usr/bin:/bin", LANG="C.UTF-8", LC_ALL="C.UTF-8", GDK_BACKEND="x11",
                    XDG_SESSION_TYPE="x11", GTK_MODULES="atk-bridge", NO_AT_BRIDGE="0", PYTHONDONTWRITEBYTECODE="1")
+        # A rendering-only diagnostic after default Xvfb painting/input stalled.
+        # Official WebKit HardwareAccelerationManager maps this to compositing;
+        # the WebKit process sandbox and all production native bridges stay intact.
+        # Both original and fixed UI phases use this identical mode.
+        env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
         for key, relative in (("XDG_CONFIG_HOME", ".config"), ("XDG_CACHE_HOME", ".cache"), ("XDG_DATA_HOME", ".local/share"),
                               ("XDG_STATE_HOME", ".local/state"), ("XDG_RUNTIME_DIR", "runtime"), ("TMPDIR", "tmp")):
             path = root / relative
